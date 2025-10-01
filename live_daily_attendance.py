@@ -9,11 +9,11 @@ Live poller for ZKTeco K40 that:
 - avoids duplicate marking within the same day,
 - persists processed device epochs & daily presents in a small sqlite DB so restarts are safe.
 
-Configure DEVICE_IP and, if desired, POLL_INTERVAL and ROLLOVER_HOUR below.
+Edit DEVICE_IP below.
 Requires: pip install pyzk
 """
 import os, time, csv, sqlite3, sys
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 
 try:
     from zk import ZK
@@ -31,6 +31,7 @@ ROLLOVER_HOUR = 0               # local hour when day rolls over (0 = midnight)
 DB_PATH = 'attendance_state.db' # sqlite state
 # ---------- END CONFIG ----------
 
+# ---------------- Utility / DB ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -39,17 +40,6 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS present (day TEXT, user_id INTEGER, first_checkin_local TEXT,
                    PRIMARY KEY(day,user_id))''')
     conn.commit(); conn.close()
-
-def load_users():
-    if not os.path.exists(USERS_CSV):
-        raise SystemExit(f"Missing {USERS_CSV}. Create it with header 'id,name'.")
-    users = {}
-    with open(USERS_CSV, newline='', encoding='utf-8') as f:
-        r = csv.DictReader(f)
-        for row in r:
-            uid = int(row['id'])
-            users[uid] = {'id': uid, 'name': row['name']}
-    return users
 
 def get_meta(k):
     conn = sqlite3.connect(DB_PATH)
@@ -81,9 +71,6 @@ def is_epoch_processed(epoch):
     r = cur.fetchone(); conn.close()
     return bool(r)
 
-def day_str_for_dt(dt):
-    return dt.date().isoformat()
-
 def is_user_marked_today(user_id, daystr):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -97,6 +84,18 @@ def mark_user_present(user_id, daystr, first_checkin_local):
     cur.execute("INSERT OR REPLACE INTO present (day,user_id,first_checkin_local) VALUES (?,?,?)",
                 (daystr, user_id, first_checkin_local))
     conn.commit(); conn.close()
+
+# ---------------- Users / CSV ----------------
+def load_users():
+    if not os.path.exists(USERS_CSV):
+        raise SystemExit(f"Missing {USERS_CSV}. Create it with header 'id,name'.")
+    users = {}
+    with open(USERS_CSV, newline='', encoding='utf-8') as f:
+        r = csv.DictReader(f)
+        for row in r:
+            uid = int(row['id'])
+            users[uid] = {'id': uid, 'name': row['name']}
+    return users
 
 def make_daily_csv(users, day):
     filename = os.path.join(OUTPUT_DIR, f"attendance_{day}.csv")
@@ -129,23 +128,59 @@ def update_csv_mark_present(filename, uid, checkin_str):
                 w.writerow([rr['id'], rr['name'], rr['status'], rr['first_checkin_local']])
     return updated
 
+# --------- Timestamp compatibility helper ----------
+def rec_timestamp_to_epoch(rec_ts):
+    """
+    Accepts rec_ts that may be:
+      - int / float / numeric-like epoch seconds
+      - str numeric
+      - datetime.datetime object
+    Returns integer epoch seconds.
+    """
+    from datetime import datetime as _dt
+    if isinstance(rec_ts, _dt):
+        return int(rec_ts.timestamp())
+    if isinstance(rec_ts, bytes):
+        rec_ts = rec_ts.decode()
+    # numeric string or numeric
+    try:
+        return int(float(rec_ts))
+    except Exception:
+        raise ValueError(f"Unsupported timestamp type: {type(rec_ts)} -> {rec_ts}")
+
 def device_epoch_to_local_str(epoch):
-    # epoch is seconds
     dt = datetime.fromtimestamp(int(epoch))
     return dt.strftime('%Y-%m-%d %H:%M:%S')
 
+def day_str_for_dt(dt):
+    return dt.date().isoformat()
+
+# ---------------- Polling / Main logic ----------------
 def poll_once(users, csvfile):
     zk = ZK(DEVICE_IP, port=PORT, timeout=5)
     conn = None
     try:
         conn = zk.connect()
+        # Optionally sync device time once at connect:
+        try:
+            conn.set_time(datetime.now())
+        except Exception:
+            # ignore if device/SDK doesn't allow
+            pass
+
         recs = conn.get_attendance()  # list of records with .user_id and .timestamp
-        # sort ascending by timestamp (older first)
-        recs = sorted(recs, key=lambda r: r.timestamp)
+        # sort ascending by timestamp using robust converter
+        recs = sorted(recs, key=lambda r: rec_timestamp_to_epoch(r.timestamp))
         for rec in recs:
-            epoch = int(rec.timestamp)
+            try:
+                epoch = rec_timestamp_to_epoch(rec.timestamp)
+            except ValueError as e:
+                print(f"[{datetime.now()}] Skipping record with bad timestamp: {e}")
+                continue
+
             if is_epoch_processed(epoch):
                 continue
+
             uid = rec.user_id
             # mark processed always so we don't reprocess old logs
             mark_epoch_processed(epoch)
@@ -156,18 +191,17 @@ def poll_once(users, csvfile):
                 continue
 
             today = day_str_for_dt(datetime.fromtimestamp(epoch))
-            # Check if user already present today
             existing = is_user_marked_today(uid, today)
             if existing:
-                # already present today; ignore
                 print(f"[{datetime.now()}] {users[uid]['name']} ({uid}) scanned again at {device_epoch_to_local_str(epoch)} - already marked Present today ({existing}).")
                 continue
 
-            # Mark present
+            # mark present
             checkin_str = device_epoch_to_local_str(epoch)
-            marked = update_csv_mark_present(csvfile, uid, checkin_str)
+            update_csv_mark_present(csvfile, uid, checkin_str)
             mark_user_present(uid, today, checkin_str)
             print(f"[{datetime.now()}] MARKED PRESENT: {users[uid]['name']} ({uid}) at {checkin_str}  -> CSV updated: {os.path.basename(csvfile)}")
+
     except Exception as e:
         print(f"[{datetime.now()}] Poll error: {e}")
     finally:
@@ -187,7 +221,6 @@ def ensure_csv_for_today(users):
     current = get_meta('current_csv_date')
     csvfile = os.path.join(OUTPUT_DIR, f"attendance_{daystr}.csv")
     if current != daystr or not os.path.exists(csvfile):
-        # create fresh csv and clear any 'present' rows for the new day (present table is per-day so okay)
         make_daily_csv(users, daystr)
     return csvfile, daystr
 
@@ -198,15 +231,12 @@ def main_loop():
     print(f"[{datetime.now()}] Live poller started. Poll interval {POLL_INTERVAL}s. Current day: {daystr}")
     try:
         while True:
-            # check rollover (midnight or ROLLOVER_HOUR)
+            # rollover check
             csvfile, newday = ensure_csv_for_today(users)
             if newday != daystr:
-                # day changed
                 daystr = newday
-                # optionally reload users.csv in case names changed
                 users = load_users()
                 print(f"[{datetime.now()}] New day started: {daystr}. CSV: {csvfile}")
-
             poll_once(users, csvfile)
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
